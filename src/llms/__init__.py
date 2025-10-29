@@ -48,6 +48,83 @@ def text_only_messages(messages: list[dict[str, T.Any]]) -> list[dict[str, T.Any
     return new_messages
 
 
+async def get_next_message_gpt_oss_vllm(
+    *,
+    messages: list[dict[str, T.Any]],
+    model: Model,
+    temperature: float,
+    max_new_tokens: int = 4096,  # Lowered from 8192 to be safer
+    retry_secs: int = 15,
+    max_retries: int = 3,
+) -> tuple[str, ModelUsage] | None:
+    """Generate response using GPT-OSS 20B via vLLM server with dynamic max_tokens."""
+    MAX_MODEL_LEN = 24576  # vLLM server --max-model-len (upgraded from 16K to 24K)
+    SAFETY_MARGIN = 256  # Reserve some tokens for safety
+
+    retry_count = 0
+    current_max_tokens = max_new_tokens
+
+    while retry_count < max_retries:
+        try:
+            client = AsyncOpenAI(
+                api_key="EMPTY",
+                base_url="http://localhost:8001/v1",
+                timeout=120.0,
+            )
+
+            text_messages = text_only_messages(messages)
+
+            response = await client.chat.completions.create(
+                model="openai/gpt-oss-20b",
+                messages=text_messages,
+                max_tokens=current_max_tokens,
+                temperature=temperature,
+                top_p=0.9,
+                extra_body={"reasoning_effort": "low"},
+            )
+
+            response_text = response.choices[0].message.content
+            usage = ModelUsage(
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=response.usage.completion_tokens,
+            )
+
+            return response_text, usage
+
+        except Exception as e:
+            error_msg = str(e)
+            logfire.debug(f"GPT-OSS vLLM error (attempt {retry_count+1}/{max_retries}): {error_msg}")
+
+            # Try to extract prompt_tokens from error and dynamically adjust max_tokens
+            if "prompt" in error_msg.lower() or "token" in error_msg.lower():
+                try:
+                    # Common error format: "... X tokens ..." or "... prompt: X ..."
+                    import re
+                    numbers = re.findall(r'\d+', error_msg)
+                    if numbers:
+                        prompt_tokens = int(numbers[0])
+                        # Calculate safe max_tokens
+                        available_tokens = MAX_MODEL_LEN - prompt_tokens - SAFETY_MARGIN
+                        if available_tokens > 0:
+                            current_max_tokens = min(available_tokens, 4096)
+                            logfire.debug(f"Adjusted max_tokens to {current_max_tokens} based on prompt_tokens={prompt_tokens}")
+                            retry_count += 1
+                            continue
+                except (ValueError, IndexError):
+                    pass
+
+            retry_count += 1
+            if retry_count >= max_retries:
+                logfire.debug(f"GPT-OSS vLLM failed after {max_retries} retries")
+                return None
+
+            await asyncio.sleep(retry_secs)
+
+    return None
+
+
 async def get_next_message_anthropic(
     anthropic_client: AsyncAnthropic,
     system_messages: list[dict[str, T.Any]],
@@ -633,6 +710,18 @@ async def get_next_messages(
         ]
         # filter out the Nones
         return [m for m in n_messages if m]
+    elif model == Model.gpt_oss_20b:
+        n_messages = await asyncio.gather(
+            *[
+                get_next_message_gpt_oss_vllm(
+                    messages=messages,
+                    model=model,
+                    temperature=temperature,
+                )
+                for _ in range(n_times)
+            ]
+        )
+        return [m for m in n_messages if m]
     else:
         raise ValueError(f"Invalid model: {model}")
 
@@ -890,6 +979,15 @@ async def get_next_message(
             input_tokens=response.usage_metadata.prompt_token_count,
             output_tokens=response.usage_metadata.candidates_token_count,
         )
+    elif model == Model.gpt_oss_20b:
+        result = await get_next_message_gpt_oss_vllm(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+        )
+        if result is None:
+            raise ValueError("GPT-OSS vLLM failed to generate a response")
+        return result
     else:
         raise ValueError(f"Invalid model: {model}")
 

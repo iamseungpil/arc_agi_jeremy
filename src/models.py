@@ -54,6 +54,7 @@ class Model(str, Enum):
     baseten_deepseek_r1 = "baseten_deepseek_r1"
     grok_4 = "grok-4-0709"
     grok_3 = "grok-3"
+    gpt_oss_20b = "openai/gpt-oss-20b"
 
 
 class ModelPrice(BaseModel):
@@ -159,6 +160,12 @@ model_price_map: dict[Model, ModelPrice] = {
         cache_read_per_million_cents=75,
         input_tokens_per_million_cents=300,
         output_tokens_per_million_cents=1500,
+    ),
+    Model.gpt_oss_20b: ModelPrice(
+        cache_create_per_million_cents=0,
+        cache_read_per_million_cents=0,
+        input_tokens_per_million_cents=0,
+        output_tokens_per_million_cents=0,
     ),
 }
 
